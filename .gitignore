@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+analysis_output/
+.gps_delay_history.json
+.venv/
+venv/
+*.log
+*.ubx
+*.ulg
+*.bin
+
+# 保留 log 目录中的全部测试数据。
+!/log/
+!/log/**
