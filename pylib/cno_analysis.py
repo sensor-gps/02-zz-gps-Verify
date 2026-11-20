@@ -9,7 +9,7 @@ OUTPUT_DIR = Path(__file__).resolve().parent.parent / 'analysis_output'
 
 
 def parse(path):
-    """同一历元优先使用 NAV-SAT；不混合两类消息的卫星编号。"""
+    """同一历元优先使用 NAV-SAT；不混合两类消息的卫星编号；只保留参与定位卫星数大于 0 的历元。"""
     raw = Path(path).read_bytes()
     records = {}
     stats = dict(sat_frames=0, svinfo_frames=0, checksum_errors=0)
@@ -69,38 +69,30 @@ def parse(path):
             records[tow] = row
     if not records:
         raise ValueError('未找到校验有效的 NAV-SAT / NAV-SVINFO 数据；仅含 NAV-PVT 的文件无法计算卫星载噪比。')
+    # 只记录参与定位卫星数大于 0 的历元。
+    records = {tow: row for tow, row in records.items() if row['used_count'] > 0}
+    if not records:
+        raise ValueError('日志中没有参与定位的卫星历元，无法计算载噪比对比。')
     return dict(sorted(records.items())), stats
 
 
-def align_series(series, tolerance):
-    """在第一路的 iTOW 上最近邻对齐，仅保留所有文件的共同时间范围。"""
-    if not np.isfinite(tolerance) or tolerance < 0:
-        raise ValueError('对齐容差必须是非负有限数值')
-    active_times = [[t for t, row in data.items() if row['used_count'] > 0] for data in series]
-    if any(not times for times in active_times):
+def common_series(series):
+    """取所有文件的公共 iTOW 时间范围；每路保留自身历元，不做对齐、插值或外推。"""
+    if any(not data for data in series):
         raise ValueError('至少一路日志没有参与定位的卫星，无法建立有效对比时间范围。')
-    # 启动阶段尚未建立 GPS 时间时也可能输出很小的 iTOW，避免拉伸整个横轴。
-    lower = max(min(times) for times in active_times)
-    upper = min(max(times) for times in active_times)
-    times = np.array([t for t in series[0] if lower <= t <= upper], dtype=np.int64)
-    if not len(times):
+    # 交集：起点取各文件最晚的首个历元，终点取各文件最早的末个历元。
+    lower = max(min(data) for data in series)
+    upper = min(max(data) for data in series)
+    if lower > upper:
         raise ValueError('所选日志没有共同的 iTOW 时间范围，请检查是否来自同一次记录且未跨 GPS 周。')
-    aligned = []
+    clipped = []
     for data in series:
-        keys = np.array(sorted(data), dtype=np.int64)
-        rows = []
-        for t in times:
-            j = int(np.searchsorted(keys, t))
-            candidates = [k for k in (j - 1, j) if 0 <= k < len(keys)]
-            k = min(candidates, key=lambda k: abs(int(keys[k]) - int(t)))
-            source = int(keys[k])
-            rows.append(dict(data[source], source_itow_ms=source)
-                        if abs(source - t) <= tolerance else None)
-        aligned.append(rows)
-    return times, aligned
+        times = np.array([t for t in data if lower <= t <= upper], dtype=np.int64)
+        clipped.append((times, [data[int(t)] for t in times]))
+    return int(lower), int(upper), clipped
 
 
-def analyze(selected, tolerance):
+def analyze(selected):
     series, summaries = [], []
     for number, path in selected:
         try:
@@ -109,27 +101,28 @@ def analyze(selected, tolerance):
             raise ValueError(f'GPS {number}：{exc}') from exc
         series.append(data)
         summaries.append((number, len(data), stats))
-    times, aligned = align_series(series, tolerance)
-    return selected, times, aligned, summaries
+    lower, upper, clipped = common_series(series)
+    return dict(selected=selected, summaries=summaries,
+                lower=lower, upper=upper, series=clipped)
 
 
 def make_figure(result, labels=None):
     from matplotlib.figure import Figure
-    selected, times, aligned, _ = result
     fig = Figure(figsize=(14, 5), dpi=120)
     axes = fig.subplots(1, 2, sharex=True)
-    x = (times - times[0]) / 1000
-    for (number, path), rows in zip(selected, aligned):
+    origin = result['lower']
+    for (number, path), (times, rows) in zip(result['selected'], result['series']):
+        x = (times - origin) / 1000
         for ax, field in zip(axes, ('used_count', 'mean_cno')):
-            values = [row[field] if row else np.nan for row in rows]
+            values = [row[field] for row in rows]
             ax.plot(x, values, label=(labels or {}).get(number) or Path(path).name, linewidth=1.1)
     axes[0].set(title='参与定位卫星数', ylabel='卫星数（颗）')
     axes[1].set(title='参与定位卫星平均载噪比', ylabel='平均 C/N0（dB-Hz）')
     for ax in axes:
-        ax.set_xlabel('共同时间范围内相对 iTOW（秒）')
+        ax.set_xlabel('相对公共时间起点 iTOW（秒）')
         ax.grid(True, alpha=.3)
         ax.legend()
-    fig.suptitle('GPS 载噪比对比（按 iTOW 对齐）')
+    fig.suptitle('GPS 载噪比对比（公共时间范围）')
     fig.tight_layout()
     return fig
 
@@ -145,17 +138,15 @@ def show(parent, result, labels=None):
     image_path = OUTPUT_DIR / (stem + '.png')
     csv_path = OUTPUT_DIR / (stem + '.csv')
     fig.savefig(image_path, dpi=160)
-    selected, times, aligned, _ = result
     with csv_path.open('w', newline='', encoding='utf-8-sig') as stream:
         writer = csv.writer(stream)
-        writer.writerow(['gps', 'legend_name', 'reference_itow_ms', 'source_itow_ms', 'source_message',
+        writer.writerow(['gps', 'legend_name', 'itow_ms', 'source_message',
                          'used_satellites', 'valid_cno_satellites', 'mean_cno_dbhz'])
-        for (number, path), rows in zip(selected, aligned):
+        for (number, path), (times, rows) in zip(result['selected'], result['series']):
             name=(labels or {}).get(number) or Path(path).name
             for t, row in zip(times, rows):
-                writer.writerow([number, name, int(t), row['source_itow_ms'], row['source'],
-                                 row['used_count'], row['cno_count'], row['mean_cno']]
-                                if row else [number, name, int(t), '', '', '', '', ''])
+                writer.writerow([number, name, int(t), row['source'],
+                                 row['used_count'], row['cno_count'], row['mean_cno']])
     window = tk.Toplevel(parent)
     window.title('C/N0 载噪比对比')
     window.geometry('1400x650')

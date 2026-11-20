@@ -383,10 +383,7 @@ class App(tk.Tk):
             name=tk.StringVar(); self.cno_labels.append(name)
             ttk.Label(self.cno_area,text='图例名称').grid(row=i,column=3,padx=(8,2))
             ttk.Entry(self.cno_area,textvariable=name,width=18).grid(row=i,column=4,sticky='ew')
-        self.cno_tol=tk.StringVar(value='200')
-        ttk.Label(self.cno_area,text='对齐容差(ms)').grid(row=3,column=0,padx=8,sticky='w')
-        ttk.Entry(self.cno_area,textvariable=self.cno_tol,width=10).grid(row=3,column=1,sticky='w')
-        ttk.Label(self.cno_area,text='自动解析 NAV-SAT / NAV-SVINFO；同一 iTOW 优先使用 NAV-SAT。\n比较参与定位卫星数及有效 C/N0 的算术平均值；不需要真值文件。\n以第一路已选择的 GPS 为参考，在共同时间范围内最近邻对齐；不插值。').grid(row=4,column=0,columnspan=3,sticky='w',padx=8,pady=8)
+        ttk.Label(self.cno_area,text='自动解析 NAV-SAT / NAV-SVINFO；同一 iTOW 优先使用 NAV-SAT。\n只统计参与定位卫星数大于 0 的历元，比较参与定位卫星数及有效 C/N0 的算术平均值；不需要真值文件。\n多路时取所有文件公共 iTOW 时间范围，各路按自身历元绘制；不做对齐、插值或外推。').grid(row=4,column=0,columnspan=5,sticky='w',padx=8,pady=8)
         self.cno_button=ttk.Button(self.cno_area,text='开始分析并导出图片',command=self.run_cno)
         self.cno_button.grid(row=5,column=1,sticky='e',pady=8)
         self.cno_log=tk.Text(self.cno_area,height=16)
@@ -753,9 +750,7 @@ class App(tk.Tk):
             if plt is None: raise ValueError('请先安装 matplotlib')
             selected=[(i+1,v.get().strip()) for i,v in enumerate(self.cno_gps) if v.get().strip()]
             labels={number:self.cno_labels[number-1].get().strip() or os.path.basename(path) for number,path in selected}
-            if len(selected)<2: raise ValueError('请至少选择两路 GPS 原始文件')
-            tolerance=float(self.cno_tol.get())
-            if not np.isfinite(tolerance) or tolerance<0: raise ValueError('对齐容差必须是非负有限数值')
+            if not selected: raise ValueError('请至少选择一路 GPS 原始文件')
         except Exception as exc:
             messagebox.showerror('载噪比分析失败',str(exc)); return
         self.save_history(); self._cno_running=True
@@ -767,15 +762,13 @@ class App(tk.Tk):
                 from pylib import cno_analysis
                 plt.rcParams['font.sans-serif']=['Microsoft YaHei','SimHei','DejaVu Sans']
                 plt.rcParams['axes.unicode_minus']=False
-                self.cno_log.insert('end',f'共同有效范围：{int(result[1][0])}～{int(result[1][-1])} ms，共 {len(result[1])} 个参考历元\n')
-                for (number,count,stats),rows in zip(result[3],result[2]):
-                    valid=[r for r in rows if r]
-                    values=[r['mean_cno'] for r in valid if np.isfinite(r['mean_cno'])]
-                    self.cno_log.insert('end',f'GPS {number}：{count} 个历元，匹配 {len(valid)} 个参考时刻；SAT={stats["sat_frames"]} 帧，SVINFO={stats["svinfo_frames"]} 帧，校验失败={stats["checksum_errors"]} 帧\n')
-                    if values: self.cno_log.insert('end',f'  对齐后平均 C/N0={np.mean(values):.2f} dB-Hz；平均使用卫星数={np.mean([r["used_count"] for r in valid]):.2f}\n')
-                    else: self.cno_log.insert('end','  没有参与定位且 C/N0>0 的有效卫星数据。\n')
-                if not any(all(row is not None for row in rows) for rows in zip(*result[2])):
-                    raise ValueError('共同时间范围内没有满足容差的多路共同匹配点，请检查日志时间及容差')
+                lower,upper=result['lower'],result['upper']
+                self.cno_log.insert('end',f'公共时间范围：{lower}～{upper} ms，跨度 {(upper-lower)/1000:.1f} s\n')
+                for (number,count,stats),(times,rows) in zip(result['summaries'],result['series']):
+                    values=[r['mean_cno'] for r in rows if np.isfinite(r['mean_cno'])]
+                    self.cno_log.insert('end',f'GPS {number}：参与定位历元 {count} 个，公共范围内 {len(times)} 个；SAT={stats["sat_frames"]} 帧，SVINFO={stats["svinfo_frames"]} 帧，校验失败={stats["checksum_errors"]} 帧\n')
+                    if values: self.cno_log.insert('end',f'  公共范围内平均 C/N0={np.mean(values):.2f} dB-Hz；平均使用卫星数={np.mean([r["used_count"] for r in rows]):.2f}\n')
+                    else: self.cno_log.insert('end','  参与定位但没有 C/N0>0 的有效卫星数据。\n')
                 image_path,csv_path=cno_analysis.show(self,result,labels=labels)
                 self.cno_log.insert('end',f'图片已保存：{image_path}\n数据已保存：{csv_path}\n')
             except Exception as exc: messagebox.showerror('载噪比分析失败',str(exc))
@@ -784,7 +777,7 @@ class App(tk.Tk):
         def worker():
             try:
                 from pylib.cno_analysis import analyze
-                result=analyze(selected,tolerance)
+                result=analyze(selected)
                 self.after(0,lambda:finish(result=result))
             except Exception as exc:
                 self.after(0,lambda error=str(exc):finish(error=error))
@@ -819,7 +812,6 @@ class App(tk.Tk):
             self.eph_path.set(d.get('eph_path',''))
             for v,p in zip(self.cno_gps,d.get('cno_gps',d.get('gps',[]))): v.set(p)
             for v,name in zip(self.cno_labels,d.get('cno_labels',[])): v.set(name)
-            self.cno_tol.set(str(d.get('cno_tol','200')))
             self.accuracy_ref.set(d.get('accuracy_ref',self.ref.get()))
             for v,p in zip(self.accuracy_gps,d.get('accuracy_gps',d.get('gps',[]))):v.set(p)
             self.accuracy_tol.set(str(d.get('accuracy_tol','200')))
@@ -837,7 +829,7 @@ class App(tk.Tk):
         d={'ref':self.ref.get(),'gps':[v.get() for v in self.gps],'gps_labels':[v.get() for v in self.gps_labels],'tol':self.tol.get(),
            'fusion_frame':self.fusion_frame.get(),'north_confirmed':self.north_confirmed.get(),
            'anchor_boot':self.anchor_boot.get(),'anchor_tow':self.anchor_tow.get(),'eph_path':self.eph_path.get(),
-           'cno_gps':[v.get() for v in self.cno_gps],'cno_labels':[v.get() for v in self.cno_labels],'cno_tol':self.cno_tol.get(),
+           'cno_gps':[v.get() for v in self.cno_gps],'cno_labels':[v.get() for v in self.cno_labels],
            'accuracy_ref':self.accuracy_ref.get(),'accuracy_gps':[v.get() for v in self.accuracy_gps],'accuracy_tol':self.accuracy_tol.get(),
            'sanitize_source':self.sanitize_source.get(),'sanitize_destination':self.sanitize_destination.get(),
            'relative_paths':[v.get() for v in self.relative_paths],'relative_window':self.relative_window.get(),'relative_tolerance':self.relative_tolerance.get(),
