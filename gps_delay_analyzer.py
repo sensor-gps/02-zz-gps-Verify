@@ -14,7 +14,7 @@ try:
 except ImportError:
     plt = None
 
-FIELDS = ("lat", "lon", "alt", "vel_n", "vel_e", "vel_d", "speed", "heading", "hacc", "vacc", "num_sv")
+FIELDS = ("lat", "lon", "alt", "vel_n", "vel_e", "vel_d", "speed", "heading", "hacc", "vacc", "sacc", "num_sv")
 DELAY_CHANNELS = (('vel_n','速度 N'),('vel_e','速度 E'),('vel_d','速度 D'),('speed','水平速度'),
                   ('pos_n','位置 N'),('pos_e','位置 E'),('pos_d','位置 D'))
 # 两路 GPS 互比不输出水平地速通道；该通道只用于 GPS 相对 ULog 真值的比较。
@@ -67,6 +67,8 @@ def parse_ubx(path, exact_fix=None):
             hmsl = struct.unpack_from("<i", p, 36)[0]
             hacc, vacc = struct.unpack_from("<II", p, 40)
             vel_n, vel_e, vel_d, speed, head = struct.unpack_from("<iiiii", p, 48)
+            # sAcc：速度精度估计（mm/s），位于 NAV-PVT 偏移 68。
+            sacc = struct.unpack_from("<I", p, 68)[0]
             num_sv = p[23]
             if exact_fix is not None and p[20]!=exact_fix:
                 i=end
@@ -78,7 +80,7 @@ def parse_ubx(path, exact_fix=None):
                 continue
             _add(out, tow, lat=lat/1e7, lon=lon/1e7, alt=hmsl/1000, vel_n=vel_n/1000,
                  vel_e=vel_e/1000, vel_d=vel_d/1000, speed=speed/1000, heading=head/1e5,
-                 hacc=hacc/1000, vacc=vacc/1000, num_sv=num_sv)
+                 hacc=hacc/1000, vacc=vacc/1000, sacc=sacc/1000, num_sv=num_sv)
         i = end
     return out
 
@@ -471,6 +473,54 @@ class App(tk.Tk):
         scrollbar.grid(row=6,column=0,columnspan=3,sticky='ew');self.relative_table.configure(xscrollcommand=scrollbar.set)
         self.relative_log=tk.Text(self.relative_area,height=8,wrap='word');self.relative_log.grid(row=7,column=0,columnspan=3,sticky='nsew')
         self.relative_area.columnconfigure(1,weight=1);self.relative_area.rowconfigure(7,weight=1)
+        self.list.insert('end','sAcc 一致性评估')
+        self.sacc_area=ttk.Frame(self)
+        self.sacc_ref=tk.StringVar();self.sacc_gps=[tk.StringVar() for _ in range(3)]
+        self.sacc_tol=tk.StringVar(value='200');self.sacc_yaw_diff=tk.StringVar()
+        self.sacc_estimate_yaw=tk.BooleanVar(value=True);self.sacc_compensate=tk.BooleanVar(value=True)
+        ttk.Label(self.sacc_area,text='ULog 真值文件').grid(row=0,column=0,sticky='w',padx=8)
+        ttk.Entry(self.sacc_area,textvariable=self.sacc_ref,width=75).grid(row=0,column=1,sticky='ew')
+        ttk.Button(self.sacc_area,text='选择',command=lambda:self.pick(self.sacc_ref,'ulog')).grid(row=0,column=2)
+        for i,v in enumerate(self.sacc_gps):
+            ttk.Label(self.sacc_area,text=f'GPS {i+1} 原始文件').grid(row=i+1,column=0,sticky='w',padx=8,pady=6)
+            ttk.Entry(self.sacc_area,textvariable=v,width=75).grid(row=i+1,column=1,sticky='ew')
+            ttk.Button(self.sacc_area,text='选择',command=lambda v=v:self.pick(v)).grid(row=i+1,column=2)
+        ttk.Label(self.sacc_area,text='对齐容差(ms)').grid(row=4,column=0,sticky='w',padx=8)
+        ttk.Entry(self.sacc_area,textvariable=self.sacc_tol,width=10).grid(row=4,column=1,sticky='w')
+        ttk.Label(self.sacc_area,text='固定 yaw_diff(°)').grid(row=4,column=2,sticky='w',padx=(8,2))
+        ttk.Entry(self.sacc_area,textvariable=self.sacc_yaw_diff,width=10).grid(row=4,column=3,sticky='w')
+        ttk.Checkbutton(self.sacc_area,text='估计 yaw_diff',variable=self.sacc_estimate_yaw).grid(row=4,column=4,sticky='w',padx=(8,2))
+        ttk.Checkbutton(self.sacc_area,text='时延补偿(NE)',variable=self.sacc_compensate).grid(row=4,column=5,sticky='w',padx=(8,2))
+        ttk.Label(self.sacc_area,text='GPS1 必选，用于建立 ULog 到 iTOW 的时间映射；可再选 GPS2、GPS3。\n'
+                  '默认先估计并补偿各路相对真值的 NE 时延，再用真值速度与 GPS 速度计算三维速度残差 r=‖v_gps−v_truth‖。\n'
+                  'sAcc 取 UBX NAV-PVT 的速度精度估计，视为一倍速度中误差；样本需 sAcc>0 且残差三分量有限，少于 10 个时指标为 NaN。\n'
+                  '秩相关系数：sAcc 与 r 分别取平均秩（并列共享平均秩）后求 Pearson；全部相等导致分母为 0 时返回 NaN。\n'
+                  '余弦相似度：Σ(sAcc·r)/sqrt(ΣsAcc²·Σr²)，越接近 1 表示两者越接近同比例变化。\n'
+                  '中位数：sAcc 中位数与速度残差中位数仅作描述输出，不参与对比好坏。\n'
+                  '占比：r 小于 1/2/3 倍 sAcc 的历元比例；对比时与正态分布 ±1/2/3σ 目标 68.27%/95.45%/99.73% 比较，越接近越好。\n'
+                  '输入两路及以上时以第一路 GPS1 为基准；ρ、余弦相似度越大越好。',
+                  wraplength=1250,justify='left').grid(row=5,column=0,columnspan=6,sticky='ew',padx=8,pady=8)
+        self.sacc_button=ttk.Button(self.sacc_area,text='开始 sAcc 一致性评估',command=self.run_sacc)
+        self.sacc_button.grid(row=6,column=1,sticky='e')
+        self.sacc_log=tk.Text(self.sacc_area,height=6,wrap='word',font=('Consolas',10))
+        self.sacc_log.grid(row=7,column=0,columnspan=6,sticky='nsew',padx=8,pady=(4,6))
+        from pylib.sacc_reliability import HEADERS as SACC_HEADERS,COMPARISON_HEADERS as SACC_COMPARISON_HEADERS
+        self.sacc_table=ttk.Treeview(self.sacc_area,columns=SACC_HEADERS,show='headings',height=5)
+        for key in SACC_HEADERS:
+            self.sacc_table.heading(key,text=key);self.sacc_table.column(key,width=120,anchor='center',stretch=True)
+        self.sacc_table.grid(row=8,column=0,columnspan=5,sticky='nsew',padx=(8,0))
+        table_scroll=ttk.Scrollbar(self.sacc_area,orient='horizontal',command=self.sacc_table.xview)
+        table_scroll.grid(row=9,column=0,columnspan=5,sticky='ew',padx=(8,0));self.sacc_table.configure(xscrollcommand=table_scroll.set)
+        ttk.Label(self.sacc_area,text='相对 GPS1 对比（ρ/余弦越大越好；覆盖率越接近正态目标越好；绿色为更优）').grid(row=10,column=0,columnspan=6,sticky='w',padx=8,pady=(6,2))
+        self.sacc_comparison=ttk.Treeview(self.sacc_area,columns=SACC_COMPARISON_HEADERS,show='headings',height=6)
+        for key in SACC_COMPARISON_HEADERS:
+            self.sacc_comparison.heading(key,text=key);self.sacc_comparison.column(key,width=110,anchor='center',stretch=True)
+        for tag,color,bg in (('better','#137333','#e6f4ea'),('worse','#b3261e','#fce8e6'),('neutral','#555555','#ffffff')):
+            self.sacc_comparison.tag_configure(tag,foreground=color,background=bg)
+        self.sacc_comparison.grid(row=11,column=0,columnspan=5,sticky='nsew',padx=(8,0))
+        comparison_scroll=ttk.Scrollbar(self.sacc_area,orient='horizontal',command=self.sacc_comparison.xview)
+        comparison_scroll.grid(row=12,column=0,columnspan=5,sticky='ew',padx=(8,0));self.sacc_comparison.configure(xscrollcommand=comparison_scroll.set)
+        self.sacc_area.columnconfigure(1,weight=1);self.sacc_area.rowconfigure(8,weight=1);self.sacc_area.rowconfigure(11,weight=1)
         self.list.bind('<<ListboxSelect>>',self.select_project)
         self.fusion_frame=tk.StringVar(value='local')
         self.north_confirmed=tk.BooleanVar(value=True)
@@ -479,21 +529,21 @@ class App(tk.Tk):
     def select_project(self,event=None):
         selection=self.list.curselection()
         if not selection: return
-        for area in (self.project_area,self.eph_area,self.cno_area,self.accuracy_area,self.sanitize_area,self.relative_area): area.pack_forget()
-        area=(self.project_area,self.eph_area,self.cno_area,self.accuracy_area,self.sanitize_area,self.relative_area)[selection[0]]
+        for area in (self.project_area,self.eph_area,self.cno_area,self.accuracy_area,self.sanitize_area,self.relative_area,self.sacc_area): area.pack_forget()
+        area=(self.project_area,self.eph_area,self.cno_area,self.accuracy_area,self.sanitize_area,self.relative_area,self.sacc_area)[selection[0]]
         area.pack(side='right',fill='both',expand=True,padx=8,pady=8)
     def clear_previous_results(self):
         """新任务开始前释放旧图窗并清空结果；不删除磁盘导出文件。"""
-        if any(getattr(self,name,False) for name in ('_running','_cno_running','_accuracy_running','_relative_running','_sanitize_running')):
+        if any(getattr(self,name,False) for name in ('_running','_cno_running','_accuracy_running','_relative_running','_sanitize_running','_sacc_running')):
             messagebox.showinfo('任务进行中','请等待当前计算完成后再开始新计算。')
             return False
         for child in list(self.winfo_children()):
             if isinstance(child,tk.Toplevel):
                 child.destroy()
-        for name in ('log','cno_log','accuracy_log','relative_log','sanitize_log'):
+        for name in ('log','cno_log','accuracy_log','relative_log','sanitize_log','sacc_log'):
             widget=getattr(self,name,None)
             if widget is not None:widget.delete('1.0','end')
-        for name in ('accuracy_table','relative_table'):
+        for name in ('accuracy_table','relative_table','sacc_table','sacc_comparison'):
             widget=getattr(self,name,None)
             if widget is not None:widget.delete(*widget.get_children())
         return True
@@ -540,6 +590,74 @@ class App(tk.Tk):
                     data=[{t:r for t,r in d.items() if interval[0]*1000 <= t-origin <= interval[1]*1000} for d in data]
                 result=analyze_single(data[0],window=window) if len(selected)==1 else analyze(*data,window=window,tolerance_ms=tolerance)
                 self.after(0,lambda:finish(result=result))
+            except Exception as exc:self.after(0,lambda error=str(exc):finish(error=error))
+        threading.Thread(target=worker,daemon=True).start()
+    def run_sacc(self):
+        if getattr(self,'_sacc_running',False):return
+        if not self.clear_previous_results():return
+        try:
+            path=self.sacc_ref.get().strip()
+            if not path.lower().endswith(('.ulg','.ulog')):raise ValueError('请选择 ULog 真值文件')
+            selected=[(i+1,v.get().strip()) for i,v in enumerate(self.sacc_gps) if v.get().strip()]
+            if not selected or selected[0][0]!=1:raise ValueError('必须选择 GPS1 作为 ULog 时间映射锚点')
+            tolerance=float(self.sacc_tol.get())
+            if not np.isfinite(tolerance) or tolerance<0:raise ValueError('对齐容差必须是非负有限值')
+            yaw_diff=parse_optional_float(self.sacc_yaw_diff.get(),'固定 yaw_diff(°)')
+            estimate_yaw=bool(self.sacc_estimate_yaw.get())
+            compensate=bool(self.sacc_compensate.get())
+        except Exception as exc:messagebox.showerror('sAcc 一致性评估失败',str(exc));return
+        self.save_history();self._sacc_running=True;self.sacc_button.configure(state='disabled')
+        self.sacc_log.delete('1.0','end')
+        self.sacc_log.insert('end',f'正在后台解析并计算 sAcc 一致性……\n时延补偿：{"开启（NE）" if compensate else "关闭"}\n')
+        for widget in (self.sacc_table,self.sacc_comparison):widget.delete(*widget.get_children())
+        def fmt(value,spec):
+            return 'NaN' if not np.isfinite(value) else format(float(value),spec)
+        def finish(result=None,error=None):
+            try:
+                if error:raise ValueError(error)
+                results,details,paths=result
+                for label,info in results:
+                    self.sacc_table.insert('','end',values=(label,info['samples'],
+                        fmt(info['median_sacc'],'.4f'),fmt(info['median_residual'],'.4f'),
+                        fmt(info['rho'],'.5f'),fmt(info['cosine'],'.5f'),fmt(info['coverage'][0],'.2f'),
+                        fmt(info['coverage'][1],'.2f'),fmt(info['coverage'][2],'.2f')))
+                from pylib.sacc_reliability import compare
+                if len(results)>=2:
+                    for values,tag in compare(results):self.sacc_comparison.insert('','end',values=values,tags=(tag,))
+                    self.sacc_log.insert('end','对比基准：GPS1。ρ、余弦相似度越大越好；覆盖率与正态目标 68.27%/95.45%/99.73% 比较，越接近越好。\n')
+                else:
+                    self.sacc_log.insert('end','仅输入一路 GPS，不进行对比。\n')
+                for label,info in results:
+                    if info['samples']<10:
+                        self.sacc_log.insert('end',f'{label}：有效样本 {info["samples"]} < 10，指标返回 NaN。\n')
+                    else:
+                        self.sacc_log.insert('end',f'{label}：样本 {info["samples"]}，'
+                            f'sAcc中位={fmt(info["median_sacc"],".4f")} m/s，残差中位={fmt(info["median_residual"],".4f")} m/s，'
+                            f'ρ={fmt(info["rho"],".5f")}，'
+                            f'cos={fmt(info["cosine"],".5f")}，'
+                            f'<1σ={fmt(info["coverage"][0],".2f")}%，<2σ={fmt(info["coverage"][1],".2f")}%，'
+                            f'<3σ={fmt(info["coverage"][2],".2f")}%\n')
+                self.sacc_log.insert('end',f'汇总 CSV：{paths["summary"]}\n逐历元数据：{paths["detail"]}\n对比 CSV：{paths["comparison"] or "无"}\n')
+                self.sacc_log.see('end')
+            except Exception as exc:messagebox.showerror('sAcc 一致性评估失败',str(exc))
+            finally:self._sacc_running=False;self.sacc_button.configure(state='normal')
+        def worker():
+            try:
+                from pylib.fusion_reference import load
+                from pylib.accuracy_analysis import compensate_delays
+                from pylib.sacc_reliability import evaluate,export
+                series=[(number,parse_gps(p)) for number,p in selected]
+                reference=load(path,gps1=series[0][1],yaw_diff_deg=yaw_diff,estimate_yaw_diff=estimate_yaw)
+                note=rotation_description(reference,yaw_diff,estimate_yaw)
+                self.after(0,lambda note=note:self.sacc_log.insert('end',f'旋转方式：{note}\n'))
+                if compensate:
+                    series,delays=compensate_delays(reference,series)
+                    for number,delay,correlation in delays:
+                        self.after(0,lambda number=number,delay=delay,correlation=correlation:
+                                   self.sacc_log.insert('end',f'GPS {number}: NE 时延={delay:+d} ms（corr={correlation:.5f}），时间戳偏移 {-delay:+d} ms\n'))
+                results,details=evaluate(reference,series,tolerance)
+                paths=export(results,details)
+                self.after(0,lambda:finish(result=(results,details,paths)))
             except Exception as exc:self.after(0,lambda error=str(exc):finish(error=error))
         threading.Thread(target=worker,daemon=True).start()
     def pick_sanitize(self,row):
@@ -710,6 +828,9 @@ class App(tk.Tk):
             for v,p in zip(self.relative_paths,d.get('relative_paths',d.get('gps',[]))):v.set(p)
             self.relative_window.set(str(d.get('relative_window','3')))
             self.relative_tolerance.set(str(d.get('relative_tolerance','60')))
+            self.sacc_ref.set(d.get('sacc_ref',d.get('accuracy_ref',self.ref.get())))
+            for v,p in zip(self.sacc_gps,d.get('sacc_gps',d.get('accuracy_gps',d.get('gps',[])))):v.set(p)
+            self.sacc_tol.set(str(d.get('sacc_tol','200')))
             # 固定 yaw_diff 与估计开关都不写入历史：启动时固定值为空、估计默认打开。
         except (OSError,ValueError,TypeError,json.JSONDecodeError): pass
     def save_history(self):
@@ -719,7 +840,8 @@ class App(tk.Tk):
            'cno_gps':[v.get() for v in self.cno_gps],'cno_labels':[v.get() for v in self.cno_labels],'cno_tol':self.cno_tol.get(),
            'accuracy_ref':self.accuracy_ref.get(),'accuracy_gps':[v.get() for v in self.accuracy_gps],'accuracy_tol':self.accuracy_tol.get(),
            'sanitize_source':self.sanitize_source.get(),'sanitize_destination':self.sanitize_destination.get(),
-           'relative_paths':[v.get() for v in self.relative_paths],'relative_window':self.relative_window.get(),'relative_tolerance':self.relative_tolerance.get()}
+           'relative_paths':[v.get() for v in self.relative_paths],'relative_window':self.relative_window.get(),'relative_tolerance':self.relative_tolerance.get(),
+           'sacc_ref':self.sacc_ref.get(),'sacc_gps':[v.get() for v in self.sacc_gps],'sacc_tol':self.sacc_tol.get()}
         try:
             with open(self.config_path,'w',encoding='utf-8') as f: json.dump(d,f,ensure_ascii=False,indent=2)
         except OSError: pass
